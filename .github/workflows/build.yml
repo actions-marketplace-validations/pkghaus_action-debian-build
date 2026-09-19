@@ -91,7 +91,7 @@ jobs:
         target: ${{ fromJSON(inputs.targets) }}
     steps:
       - name: Checkout packaging repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
         with:
           # This checkout is mounted into a container that then runs upstream
           # build code -- debian/rules, upstream makefiles, cargo build scripts.
