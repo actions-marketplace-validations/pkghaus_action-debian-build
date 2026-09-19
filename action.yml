@@ -24,6 +24,16 @@ inputs:
       debian/tests/. "on" or "off".
     required: false
     default: "on"
+  SOURCE_SIGNING_KEY:
+    description: >
+      Armored OpenPGP secret key whose signing subkey signs the .dsc this
+      build produces. Optional: with no key the source package is unsigned,
+      which is what it was before this input existed. Pass a secret, never a
+      literal. The key must be passphrase-less and must NOT be the key that
+      signs the archive's Release files, because a keyring holding both would
+      let this one be accepted for either.
+    required: false
+    default: ""
 runs:
   # A composite action rather than the docker action used by action-forge-publish:
   # runs.image takes only static values, so a docker action could neither select
@@ -36,6 +46,7 @@ runs:
         IMAGE: ${{ inputs.IMAGE }}
         SUITE: ${{ inputs.SUITE }}
         WORKING_DIRECTORY: ${{ inputs.WORKING_DIRECTORY }}
+        SOURCE_SIGNING_KEY: ${{ inputs.SOURCE_SIGNING_KEY }}
       run: |
         set -euo pipefail
 
@@ -65,9 +76,15 @@ runs:
             ref="${IMAGE}:${SUITE}"
         fi
 
+        # --env NAME rather than --env NAME=value: the name form takes the
+        # value from this step's environment, so the key never appears in the
+        # container's argv, where any process on the runner could read it.
+        # Empty is the normal case and the entrypoint treats it as "do not
+        # sign", so this is unconditional.
         docker run --rm \
           --volume "${GITHUB_WORKSPACE}/${WORKING_DIRECTORY}:/target" \
           --workdir /target \
+          --env SOURCE_SIGNING_KEY \
           "${ref}"
 
     - name: Run DEP-8 tests
@@ -130,6 +147,34 @@ runs:
         # test marked isolation-container therefore SKIPs on every backend
         # reachable from inside a container. debian:$SUITE carries no init, so
         # build a testbed with the smallest one autopkgtest accepts.
+        # Pull the base image before anything needs it, with a retry, because
+        # Docker Hub is the one third-party host a build leg still reaches
+        # without one. entrypoint.sh already wraps the upstream clone and the
+        # rustup bootstrap; this is the same exposure on up to 54 legs of a
+        # fleet-wide wave, against a host with a documented rate limit.
+        #
+        # Observed: registry-1.docker.io answering 502 Bad Gateway for the
+        # debian:testing manifest on one leg of a six-leg ingest. A single
+        # failed leg skips the publish job, so a transient 502 on a base-image
+        # pull costs the whole publish and needs a human to press re-run.
+        #
+        # Pulling here rather than retrying `docker build` covers both users of
+        # the image: neither the build below nor the `docker run` in the
+        # extra-debs branch reaches the registry once it is in the local store.
+        # Backoff matches retry() in entrypoint.sh: 5 attempts, 2s doubling.
+        attempt=1
+        delay=2
+        until docker pull -q "debian:${SUITE}"; do
+            if [ "${attempt}" -ge 5 ]; then
+                echo "FATAL: pulling debian:${SUITE} failed after 5 attempts" >&2
+                exit 1
+            fi
+            echo "::warning::pulling debian:${SUITE} attempt ${attempt}/5 failed; retrying in ${delay}s"
+            sleep "${delay}"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+        done
+
         testbed="$(mktemp -d)"
         {
             echo "FROM debian:${SUITE}"
@@ -159,6 +204,16 @@ runs:
                     https://apt.pkg.haus/pkghaus-archive-keyring.gpg
                 echo 'deb [signed-by=/usr/share/keyrings/pkghaus-archive-keyring.gpg] https://apt.pkg.haus ${SUITE} main' \
                     > /etc/apt/sources.list.d/pkghaus.list
+                # Marks these fetches as the pipeline's own so the archive
+                # Worker does not count them as downloads. This runs on all six
+                # legs of every release of the package that needs them, and
+                # without the marker i3lock-color climbs the published
+                # statistics on our own CI rather than on anybody's use of it.
+                # The Worker matches the marker as a substring, which is why it
+                # is appended to apt's own product token rather than replacing
+                # it.
+                printf 'Acquire::http::User-Agent \"Debian APT-HTTP/1.3 pkghaus-ci\";\n' \
+                    > /etc/apt/apt.conf.d/99pkghaus-ci
                 apt-get update -qq
                 cd /out && apt-get download ${extra_debs}
             "

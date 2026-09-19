@@ -22,10 +22,11 @@ with `lintian` and collecting artifacts all live here and are shared.
 | `IMAGE` | `ghcr.io/pkghaus/deb-builder` | Builder image, without the suite tag. |
 | `WORKING_DIRECTORY` | `.` | Directory holding `debian/` and `package.conf`, relative to the workspace. |
 | `DEP8` | `on` | `off` skips the package's DEP-8 tests. Any other value is an error. |
+| `SOURCE_SIGNING_KEY` | none | Armored OpenPGP secret key whose signing subkey signs the `.dsc`. Pass a secret. With none the source package is unsigned. |
 
-Packages land in `debs/` inside that directory, alongside two records of how
-they were built: the `.buildinfo` dpkg emits, and a `.source` naming the
-upstream commit. See [Build records](#build-records).
+Packages land in `debs/` inside that directory, alongside the source package
+they were built from and two records of how: the `.buildinfo` dpkg emits, and a
+`.source` naming the upstream commit. See [Build records](#build-records).
 
 A reusable workflow is included that fans the build out across every suite and
 architecture, so a packaging repository can validate a tag with a few lines,
@@ -94,12 +95,55 @@ LINTIAN=warn
 
 | Key | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `UPSTREAM` | yes | - | Git URL of the upstream project. Any URL `git clone` accepts. |
-| `VERSION` | yes | - | Tag or branch to build. Overridable from the environment for local one-off builds. |
-| `TOOLCHAIN` | no | `none` | `rust` bootstraps rustup's stable toolchain; `none` relies on `debian/control`. |
+| `UPSTREAM` | yes, unless native | - | Git URL of the upstream project. Any URL `git clone` accepts. |
+| `VERSION` | yes, unless native | - | Tag or branch to build. Overridable from the environment for local one-off builds. |
+| `TOOLCHAIN` | no | `none` | `none` relies on `debian/control`, which is what every package in the fleet does. `rust` is the legacy path: it curls a toolchain dpkg cannot record. |
 | `DBGSYM` | no | `0` | `1` or `on` builds and publishes the automatic `-dbgsym` package, `0` or `off` does not. Any other value is an error. |
 | `LINTIAN` | no | `warn` | `off` skips checks, `warn` reports them, `error` fails the build on an error tag. |
 | `SETUP_HOOK` | no | - | Shell run after the toolchain and before the build, in the entrypoint's own shell, so `PATH` changes stick. |
+
+### The upstream revision travels in the source package
+
+The clone's `.git` is removed before the build: a source package cannot contain
+one, and anything reading it would make our build differ from a rebuild of our
+own `.dsc`. That is what makes Go binaries reproducible, since `go build` stamps
+`vcs.revision` into any binary built inside a repository.
+
+The cost is that a build can no longer ask git what revision it is. So the
+builder writes the commit it cloned to **`debian/upstream-commit`**, before the
+build and inside the directory that ships in the `.dsc`, where a rebuilder gets
+the same value:
+
+```make
+UPSTREAM_COMMIT := $(shell cat debian/upstream-commit 2>/dev/null)
+```
+
+An environment variable cannot serve here: dpkg records only
+`DEB_BUILD_OPTIONS` and `SOURCE_DATE_EPOCH` in the `.buildinfo`'s `Environment`,
+so a rebuilder would not replay anything else and the rebuild would differ.
+
+A native package has no upstream and so gets no file.
+
+### Native packages have no upstream
+
+If `debian/source/format` says `3.0 (native)`, the packaging directory **is**
+the source: there is no release feed to track and no tag to clone. `UPSTREAM`
+and `VERSION` are then not merely optional but refused, because a leftover value
+is likelier to be a stale file than an intention, and ignoring it would build
+something other than what `package.conf` appears to ask for.
+
+```sh
+# A native package's package.conf. The file must still exist -- callers use it
+# to recognise a directory as a package -- but it names no upstream.
+TOOLCHAIN=none
+DBGSYM=0
+```
+
+The source tree is then named after the changelog's source name rather than a
+repository basename, and everything in the packaging directory except
+`debian/`, `package.conf` and `debs/` is copied into it. The `.source` sidecar
+records `Repository: none (native package; the source package is the source)`
+rather than leaving the field blank, which would read as a lookup that failed.
 | `DEP8_EXTRA_DEBS` | no | - | Packages from your own archive that the DEP-8 testbed needs, space-separated. See [DEP-8 tests](#dep-8-tests). |
 | `CLONE_ATTEMPTS` | no | `5` | How many times to retry cloning upstream before giving up. Each retry backs off, and a partial checkout is cleared first. |
 
@@ -107,17 +151,48 @@ The package name appears nowhere in this configuration: artifacts are named from
 what `dpkg` itself emits, so there is nothing to keep in sync with
 `debian/changelog`.
 
+### Signing the source package
+
+`SOURCE_SIGNING_KEY` makes `dpkg-buildpackage` clearsign the `.dsc` it produces.
+Leave it unset and the source package is unsigned, which is what every build did
+before the input existed.
+
+Three things are worth knowing before wiring it up.
+
+**Give it the key that signs source packages, never the one that signs your
+archive's `Release` files.** `apt` accepts any signing-capable key in the keyring
+a `Signed-By` line names, so if the two are the same key, or ship in the same
+keyring, a leak of this one forges your archive. This input is handed to every
+build leg of every package, which is a much wider surface than a publish job.
+
+**Signing happens inside `dpkg-buildpackage`, not after it.** The `.buildinfo`
+records a checksum of the `.dsc`, and dpkg recomputes it once the file is
+signed. A signature applied afterwards would leave every build record naming a
+file that no longer matches.
+
+**The signature's clock is pinned**, to the changelog date, or to the key's
+creation when that is later. An OpenPGP signature carries its creation time, so
+without this each leg of a multi-suite build signs different bytes; with it, and
+an Ed25519 key, every leg produces the same `.dsc`. The clamp is not cosmetic:
+gpg refuses outright to sign with a key the clock says does not exist yet, and
+a tag rebuilt later than it was cut hits that on the normal path.
+
+The key must be passphrase-less. A protected one fails the build with
+`No secret key` rather than hanging.
+
 ### Toolchains
 
-`TOOLCHAIN=rust` exists because Debian's `rustc` trails what current Rust
-upstreams require, so those builds need rustup regardless of suite. Every other
-language should come from `Build-Depends` in `debian/control` - a Go or C project
-needs no entry here.
+Every language comes from `Build-Depends` in `debian/control`, Rust included: a
+Rust package declares `rustup` there and pins a concrete version through
+`RUSTUP_TOOLCHAIN` in `debian/rules` or a `rust-toolchain.toml`. A Go or C
+project needs no entry here either.
 
-It installs rustup's own distribution rather than Debian's `rustup` package,
-which declares `Conflicts: cargo, rustc` and would therefore be removed again
-while `apt-get build-dep` installs a `cargo:native` build dependency, silently
-falling back to Debian's toolchain.
+`TOOLCHAIN=rust` predates that and does something different: it curls rustup's
+own distribution into `~/.cargo`, where dpkg cannot see it and no `.buildinfo`
+records it. Setting it alongside a declared `rustup` is refused, because the
+curled toolchain wins on PATH while the record names the declared one. Nothing
+in the fleet sets it; see "Recording a compiler is not the same as pinning one"
+below for the whole story.
 
 `SETUP_HOOK` covers anything else - another language runtime, an extra
 repository, a pre-build fixup - without needing a change here.
@@ -186,9 +261,9 @@ docker run --rm \
     ghcr.io/pkghaus/deb-builder:trixie
 ```
 
-Packages land in `debs/`, owned by whoever owns the checkout, with the
-`.buildinfo` and `.source` records beside them. Build a tag other than the
-pinned one by passing it in:
+Packages land in `debs/`, owned by whoever owns the checkout, with the source
+package and the `.buildinfo` and `.source` records beside them. Build a tag
+other than the pinned one by passing it in:
 
 ```sh
 docker run --rm --env VERSION=v0.22.1 \
@@ -215,7 +290,8 @@ find debian -type f ! -name rules -exec chmod 0644 {} +
 
 ## Build records
 
-Each build leaves two files in `debs/` beside the packages.
+Each build leaves two records in `debs/` beside the packages, and the source
+package they describe.
 
 `<source>_<version>_<arch>.buildinfo` is dpkg's own record of the environment
 the package was built in: every installed build dependency with its version, the
@@ -238,6 +314,113 @@ package. The split follows SLSA, where the ref is an external parameter and the
 resolved commit a resolved dependency carrying `digest.gitCommit`.
 
 The two share a filename stem so they travel together.
+
+### The source package
+
+`--build=full` rather than a binary-only build, so `debs/` also holds the
+`.dsc`, the upstream tarball and the packaging tarball. That is what makes the
+`.buildinfo` usable rather than merely readable.
+
+Given a `.buildinfo` alone, `debrebuild` resolves the entire build environment
+from `snapshot.debian.org` -- every `Installed-Build-Depends` entry at its exact
+version, at a timestamp it works out itself -- and then stops, because it cannot
+find the source. Its own documented limitation is that it "assumes that all
+packages were at some point part of Debian unstable main", and these never were.
+That limitation applies to the source package, not to the build dependencies: it
+looks for the `.dsc` in the same directory as the record first and only calls
+`debsnap` when it is absent, so publishing the two together is the whole fix.
+
+Two details follow from that:
+
+`Build-Path` is written, via `--buildinfo-option=--always-include-path`. dpkg
+emits the field only when the build directory starts with `/build/`, and
+`debrebuild`'s mmdebstrap builder calls `dirname()` on it unconditionally --
+without it the rebuild dies with `fileparse(): need a valid pathname`, and
+`--no-respect-build-path` does not help because it sets the same variable to
+undef. Builds therefore happen in `/build/<source-dir>`, which is also what
+Debian's buildds use.
+
+The upstream tarball is generated here, because a `3.0 (quilt)` package needs
+one to exist and what the builder has is a git checkout. Everything that varies
+between machines is pinned -- entry order, timestamps, ownership -- and the
+result is byte-identical across architectures, core counts, build paths,
+independent clones and all three builder images. It has to be: the suite
+qualifier lands on the Debian revision, so `1.0-1` and `1.0-1~haus13+1` share an
+upstream version and therefore one tarball.
+
+The clone's `.git` is removed once the commit has been read, so the tree the
+build sees is the tree a rebuilder gets. Go stamps `vcs.revision`, `vcs.time`
+and `vcs.modified` into any binary it builds inside a repository, and a source
+package cannot carry one, so without this every Go package was unreproducible
+from its own `.dsc`.
+
+The working tree is then restamped to that same commit date, `debian/` excepted.
+`dpkg-deb` clamps mtimes newer than `SOURCE_DATE_EPOCH` and leaves older ones
+alone, so provenance decided what a packaged file carried: a file from the clone
+is newer and got clamped to the changelog date, while a rebuilder's copy comes
+out of the tarball at upstream's date and survives untouched. Anything installed
+by a route that preserves its source mtime therefore differed between the two.
+Several debhelper tools do preserve: `dh_installexamples` copies with `cp -a`,
+and `dh_installchangelogs` and `dh_installman` go through debhelper's own
+`install_file`, which ends in a `utime` call restoring the source's timestamps.
+A file the build writes itself -- `install`, or a man page generated from
+`--help` -- is newer than the epoch down both paths and was never affected.
+`debian/` is excluded from the restamp because those files reach the
+`.debian.tar` through `dpkg-source`, which clamps them to the changelog date
+from both paths.
+
+A build fails if any file under `debian/` is older than the changelog entry.
+`dpkg-source` clamps mtimes to `SOURCE_DATE_EPOCH`, which normalises anything
+newer and preserves anything older, so a stale timestamp would make one leg's
+source package differ from another's. Nothing in the normal path can cause it --
+`git clone` and `actions/checkout` both stamp current time -- but a cache
+restore or an archive extraction that preserves timestamps would.
+
+### Recording a compiler is not the same as pinning one
+
+`.source` also carries the toolchain that actually ran, when there is one:
+
+```
+Rustc: rustc 1.98.0 (88d9e12ae 2026-08-18)
+Go: go version go1.27.0 linux/amd64
+```
+
+Read from inside the source tree, which is the only place it is true. rustup
+installs current stable and then honours a `rust-toolchain.toml`; Go's
+`GOTOOLCHAIN` follows `go.mod`. Both resolve against the working directory, so
+the same command run from `$HOME` reports the bootstrap instead.
+
+This is provenance, not mechanism. `debrebuild` reads only the `.buildinfo` and
+will never open this file. What makes a compiler reproducible is pinning it
+somewhere that ships inside the `.dsc`: `go.mod` does this for Go without any
+help, and for Rust it means a `rust-toolchain.toml` from upstream or a
+`RUSTUP_TOOLCHAIN` in `debian/rules`.
+
+Both languages use the same shape, and it is the shape that matters: a
+**bootstrap that dpkg can see**, plus an **exact version named in the source**,
+fetched checksum-verified.
+
+| | bootstrap, in `Installed-Build-Depends` | exact version, in the `.dsc` |
+| --- | --- | --- |
+| Go | `golang-go` | `go` / `toolchain` in `go.mod` |
+| Rust | `rustup` | `rust-toolchain.toml`, or `RUSTUP_TOOLCHAIN` in `debian/rules` |
+
+Debian ships `rustup` in trixie and sid. Its shims are `/usr/bin/rustc` and
+`/usr/bin/cargo`, and it honours both pinning mechanisms exactly as upstream's
+installer does. So `Build-Depends: rustup` is all a Rust package needs, and it
+is what makes the package rebuildable from its `.buildinfo` alone: a rebuilder
+resolves `rustup` from `snapshot.debian.org`, unpacks the `.dsc`, and the pin
+inside it selects the same compiler.
+
+Verified on trixie, whose own `rustc` is 1.85.0: ouch builds with 1.93.0 from
+its `rust-toolchain.toml`, and zola with 1.98.0 from its `debian/rules`. Neither
+touches Debian's rustc, and both record `rustup (= 1.27.1-3+b1)`.
+
+`TOOLCHAIN=rust` predates this and curls a toolchain into `~/.cargo`, which dpkg
+cannot see and no `.buildinfo` records. It still works, for callers that have
+not moved. Setting it *and* declaring `rustup` is refused: the curled toolchain
+wins on PATH while the record names the declared one, which is precisely the
+misrecording this replaces.
 
 ## Images
 
@@ -334,6 +517,7 @@ up. CI runs it on every suite and architecture.
 | `test-build.sh` | default build, artifact naming, `DBGSYM` both ways, `.buildinfo` collection, all three `LINTIAN` modes, `SETUP_HOOK` including a failing one, `VERSION` override, wrong-architecture diagnosis |
 | `test-retry.sh` | transient clone failures, partial-checkout cleanup, retry exhaustion, `CLONE_ATTEMPTS` bounding |
 | `test-config.sh` | missing `package.conf`, missing `UPSTREAM`/`VERSION`, unknown `TOOLCHAIN`, unknown `LINTIAN`, unknown `DBGSYM` and its word form |
+| `test-native.sh` | no `debian/upstream-commit`, a native package builds with no `UPSTREAM`, emits its `.dsc` and tarball, is named after the package, keeps `package.conf` out of the source, and is refused if it sets `UPSTREAM` |
 | `test-yamlcheck.sh` | the YAML gate accepts the workflows and rejects a duplicate key |
 
 Clone failures are driven by a `git` shim (`tests/fake-git`) rather than by
@@ -360,8 +544,8 @@ to let the null backend claim it at all.
 
 ## Security
 
-Actions are pinned to commit SHAs, checkouts carry no credentials into the build
-container, and published images carry provenance and an SBOM. See
+First-party actions stay on major tags and a third-party one would be pinned by
+SHA, checkouts carry no credentials into the build container, and published images carry provenance and an SBOM. See
 [SECURITY.md](SECURITY.md) for the trust boundaries and how to verify an image.
 
 ## License

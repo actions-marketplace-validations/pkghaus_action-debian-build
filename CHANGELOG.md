@@ -8,25 +8,105 @@ Consumers pin the floating major (`@v1`), which always points at the newest
 `package.conf` keys, artifact names — is a breaking change and gets a new
 major. Exact tags never move.
 
+## [1.11.0] - 2026-09-16
+
+### Changed
+
+- The upstream clone is shallow. Nothing read from it wants history, so a full
+  clone transferred objects that were deleted seconds later -- 925 MB against
+  40 MB for zig, 122 MB against 7 MB for zola.
+
+## [1.10.0] - 2026-09-16
+
+### Fixed
+
+- Files installed by an mtime-preserving route (`dh_installexamples`,
+  `dh_installchangelogs`) carry upstream's commit date rather than the
+  changelog's, so a `.deb` built here matches one rebuilt from its `.dsc`.
+
+## [1.9.0] - 2026-09-11
+
+### Added
+
+- `SOURCE_SIGNING_KEY`, an armored OpenPGP secret key whose signing subkey signs
+  the `.dsc`. Omitted, the source package is unsigned as before.
+
+## [1.8.0] - 2026-09-06
+
+### Fixed
+
+- The orig tarball is stamped with upstream's commit date, not the changelog's,
+  so every Debian revision of one upstream version produces the same bytes.
+- The Docker Hub pull for the DEP-8 testbed is retried, on the same budget as
+  the upstream clone.
+
+## [1.7.0] - 2026-09-04
+
+### Added
+
+- Per-phase timings, and a total for the run. A build that dies partway still
+  reports the phases that finished.
+
+### Fixed
+
+- The rustup installer is fetched on the clone's retry budget, and to a file
+  rather than piped into `sh`.
+- The `repository_dispatch` that tells the archive a tag is ready is retried.
+
+## [1.6.0] - 2026-09-02
+
+### Added
+
+- `debian/upstream-commit`, for packages whose build embeds the upstream
+  revision. It ships inside the `.dsc`; a native package gets none.
+
+## [1.5.0] - 2026-09-02
+
+### Changed
+
+- A native package is its own source: the packaging directory is copied rather
+  than an upstream cloned, and the source tree is named from the changelog.
+  **`UPSTREAM` or `VERSION` in `package.conf` is now refused**, not ignored.
+
+## [1.4.0] - 2026-09-01
+
+### Added
+
+- Builds emit their source package (`.dsc` plus tarballs) into `debs/` and
+  record `Build-Path`, which are the two things `debrebuild` needs.
+- `.source` names the compiler that ran (`Rustc:`, `Go:`), read from inside the
+  source tree.
+
+### Fixed
+
+- The clone's `.git` is removed once the commit has been read, so `go build`
+  stops stamping `vcs.revision` into every Go binary.
+
+### Changed
+
+- A Rust package declares `Build-Depends: rustup` instead of setting
+  `TOOLCHAIN=rust`; the pin in `rust-toolchain.toml` or `debian/rules` selects
+  the compiler. `TOOLCHAIN=rust` still works, and setting both is refused.
+- rustup installs with `--default-toolchain none`. **A Rust package naming no
+  version now fails** rather than building against whatever stable is that day.
+- Builds happen in `/build/<source-dir>` rather than a `mktemp` directory, so
+  `Build-Path` is identical on every leg. **A path-dependent package produces
+  different bytes than before** and becomes reproducible at the recorded path.
+- A build fails if any file under `debian/` predates the changelog entry.
+
 ## [1.3.2] - 2026-08-31
 
 ### Fixed
 
-- `DEP8_EXTRA_DEBS` never worked on a GitHub runner. The debs are fetched by a
-  container, so they land root-owned, and `autopkgtest` runs as the runner user
-  and hard-links them into its output directory: under
-  `fs.protected_hardlinks=1` that is EPERM. They are chowned to the runner
-  before `autopkgtest` sees them.
+- `DEP8_EXTRA_DEBS` works on a GitHub runner: the fetched debs are chowned to
+  the runner before `autopkgtest` hard-links them.
 
 ## [1.3.1] - 2026-08-31
 
 ### Fixed
 
-- A caller building several packages in one run verified only one of them. The
-  reusable workflow's concurrency group did not include `working_directory`, so
-  every leg of a matrix shared a group and `cancel-in-progress` cancelled all
-  but the last. The cancelled legs reported "cancelled", not failure, so the run
-  was green.
+- A caller building several packages in one run verifies all of them: the
+  reusable workflow's concurrency group includes `working_directory`.
 
 ## [1.3.0] - 2026-08-29
 
@@ -47,30 +127,25 @@ major. Exact tags never move.
 
 ### Added
 
-- `DEP8_EXTRA_DEBS` in `package.conf`: packages from this archive that the DEP-8
-  testbed needs, fetched and handed to autopkgtest alongside the built package.
-  The testbed is Debian only, so a dependency Debian does not carry cannot
-  otherwise resolve. Space-separated; a value that is not a list of Debian
-  package names fails the build before anything is installed.
+- `DEP8_EXTRA_DEBS` in `package.conf`: space-separated packages from this
+  archive that the DEP-8 testbed needs. A malformed value fails the build.
 
 ## [1.1.0] - 2026-08-26
 
 ### Added
 
 - DEP-8 tests run after the build for any package shipping `debian/tests/`.
-  A package without `debian/tests/control` is unaffected. Set `dep8: "off"` on
-  `build.yml`, or `DEP8: "off"` on the action, to skip them.
+  Set `dep8: "off"` on `build.yml`, or `DEP8: "off"` on the action, to skip.
 
 ### Changed
 
-- The reusable `build.yml` now calls this repository's own action instead of
+- The reusable `build.yml` calls this repository's own action instead of
   reimplementing the `docker run`.
 
 ### Fixed
 
-- `DBGSYM` rejects a value it does not understand. It was compared against `1`
-  alone, so `DBGSYM=yes` silently disabled the package it was written to
-  enable. `off` and `on` are now accepted alongside `0` and `1`.
+- `DBGSYM` rejects a value it does not understand. `off` and `on` are accepted
+  alongside `0` and `1`; previously anything but `1` silently meant off.
 
 ## [1.0.0] - 2026-08-14
 
@@ -79,33 +154,31 @@ First release.
 ### Added
 
 - `action-debian-build`: builds a Debian package from an upstream git tag and a
-  `debian/` directory, with `SUITE`, `IMAGE` and `WORKING_DIRECTORY` inputs.
+  `debian/` directory. Inputs `SUITE`, `IMAGE`, `WORKING_DIRECTORY`.
 - Reusable `build.yml` for validation: every suite and architecture in
-  parallel, artifacts kept briefly for inspection. Publishing belongs to the
-  pkg.haus APT archive, which builds from source itself.
-- A validated tag notifies the archive: `build.yml`'s final job fires
-  `repository_dispatch` at `pkghaus/apt` when the caller passes the optional
-  `APT_DISPATCH_TOKEN` secret (`secrets: inherit`); without it the job is a
-  no-op.
+  parallel, artifacts kept briefly for inspection.
+- A validated tag notifies the archive by `repository_dispatch`, when the
+  caller passes the optional `APT_DISPATCH_TOKEN` secret. Otherwise a no-op.
 - Builder images at `ghcr.io/<owner>/deb-builder:<suite>` for `trixie`,
-  `testing` and `unstable`, as multi-arch manifests covering `amd64` and
-  `arm64`, carrying SLSA provenance and an SBOM. `BASE_IMAGE` allows a
-  non-Debian base.
+  `testing` and `unstable`: multi-arch amd64 and arm64, carrying SLSA
+  provenance and an SBOM. `BASE_IMAGE` allows a non-Debian base.
 - `package.conf` as the per-repository contract: `UPSTREAM`, `VERSION`,
   `TOOLCHAIN`, `DBGSYM`, `LINTIAN`, `SETUP_HOOK`.
-- Upstream clones are retried five times with exponential backoff, clearing any
-  partial checkout first.
-- Builds run through `dpkg-buildpackage`, so a `.buildinfo` recording the build
-  environment is collected alongside the package.
+- Upstream clones are retried five times with exponential backoff.
+- Builds run through `dpkg-buildpackage`, so a `.buildinfo` is collected
+  alongside the package.
 - `lintian` runs on the result; `LINTIAN` selects `off`, `warn` or `error`.
-- `DBGSYM=1` builds the automatic `-dbgsym` package; the default suppresses it
-  with `noautodbgsym` so it is never built.
-- Versions carry a suite qualifier (`~haus13+1` for stable, `~testing1` for
-  testing, none for unstable), so one pooled APT archive can serve every suite
-  and upgrades order correctly across them. Artifacts keep their canonical
-  Debian filenames.
+- `DBGSYM=1` builds the automatic `-dbgsym` package; the default suppresses it.
+- Versions carry a suite qualifier (`~haus13+1` stable, `~testing1` testing,
+  none unstable) so one pooled archive serves every suite and upgrades order
+  correctly. Artifacts keep canonical Debian filenames.
 
-[Unreleased]: https://github.com/pkghaus/action-debian-build/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/pkghaus/action-debian-build/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/pkghaus/action-debian-build/compare/v1.7.0...v1.8.0
+[1.7.0]: https://github.com/pkghaus/action-debian-build/compare/v1.6.0...v1.7.0
+[1.6.0]: https://github.com/pkghaus/action-debian-build/compare/v1.5.0...v1.6.0
+[1.5.0]: https://github.com/pkghaus/action-debian-build/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/pkghaus/action-debian-build/compare/v1.3.2...v1.4.0
 [1.3.2]: https://github.com/pkghaus/action-debian-build/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/pkghaus/action-debian-build/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/pkghaus/action-debian-build/compare/v1.2.0...v1.3.0

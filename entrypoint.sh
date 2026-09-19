@@ -19,6 +19,35 @@ shopt -s inherit_errexit
 TARGET="${TARGET:-$(pwd)}"
 CLONE_ATTEMPTS="${CLONE_ATTEMPTS:-5}"
 
+# Run a command until it succeeds, on the attempt budget and doubling backoff
+# above. Every network fetch in this file gets the same treatment: the clone
+# retries because GitHub cancels HTTP/2 streams when
+# several builds clone at once, and the rustup bootstrap has the same exposure
+# to a third-party host on every Rust leg of a fleet-wide wave.
+#
+# $1 labels the messages, the rest is the command. A caller needing to clean up
+# between attempts passes a function, because the clear is part of the attempt.
+retry() { # label command...
+    local label="$1"; shift
+    local attempt=1 delay=2
+
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+
+        if [ "$attempt" -ge "$CLONE_ATTEMPTS" ]; then
+            echo "FATAL: $label failed after $CLONE_ATTEMPTS attempts" >&2
+            return 1
+        fi
+
+        echo "$label attempt $attempt/$CLONE_ATTEMPTS failed; retrying in ${delay}s" >&2
+        sleep "$delay"
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
+}
+
 # Baked in by the Dockerfile so artifacts self-identify without the workflow
 # renaming them afterwards.
 : "${DEB_SUITE:?the image must define DEB_SUITE}"
@@ -33,8 +62,7 @@ load_config() {
     }
 
     # Captured before sourcing so an explicit VERSION from the environment wins
-    # over the pinned one. This is the only override the old build.sh -v offered
-    # and the only one anything uses.
+    # over the pinned one. The only override anything uses.
     version_override="${VERSION:-}"
 
     # shellcheck source=/dev/null
@@ -47,13 +75,51 @@ load_config() {
         VERSION="$version_override"
     fi
 
-    : "${UPSTREAM:?package.conf must set UPSTREAM}"
-    : "${VERSION:?package.conf must set VERSION, or pass it in the environment}"
+    # A native package is its own upstream: there is no release feed to track
+    # and no tag to clone, so UPSTREAM and VERSION describe nothing. Everything
+    # the package is made of already sits in the packaging directory. The same
+    # test on the same file gates the bump automation in pkghaus/packages
+    # (is_native in plan-bumps.sh and bump-upstream.sh), so a package is native
+    # in one place and native everywhere.
+    #
+    # Read from the packaging directory rather than a clone that may not happen.
+    NATIVE=0
+    case "$(cat "$TARGET/debian/source/format" 2>/dev/null)" in
+        *native*) NATIVE=1 ;;
+    esac
+
+    if [ "$NATIVE" -eq 1 ]; then
+        # Refused rather than ignored. Both were meaningful before the source
+        # moved in-tree, so a leftover value is likelier to be a stale
+        # package.conf than an intention, and silently ignoring it would build
+        # something other than what the file appears to ask for.
+        [ -z "${UPSTREAM:-}" ] || {
+            echo "FATAL: $TARGET is a native package and must not set UPSTREAM" >&2
+            return 1
+        }
+        [ -z "${VERSION:-}" ] || {
+            echo "FATAL: $TARGET is a native package and must not set VERSION" >&2
+            return 1
+        }
+    else
+        : "${UPSTREAM:?package.conf must set UPSTREAM}"
+        : "${VERSION:?package.conf must set VERSION, or pass it in the environment}"
+    fi
+
     TOOLCHAIN="${TOOLCHAIN:-none}"
     DBGSYM="${DBGSYM:-0}"
     LINTIAN="${LINTIAN:-warn}"
     SETUP_HOOK="${SETUP_HOOK:-}"
-    SOURCE_DIR="${SOURCE_DIR:-$(basename "${UPSTREAM%.git}")}"
+
+    # With no UPSTREAM to take a basename from, the changelog's source name is
+    # the authority, and it is the better name anyway: deriving from the
+    # repository gives the keyring a source tree called archive-keyring/, named
+    # after the repo rather than the package.
+    if [ -n "${UPSTREAM:-}" ]; then
+        SOURCE_DIR="${SOURCE_DIR:-$(basename "${UPSTREAM%.git}")}"
+    else
+        SOURCE_DIR="${SOURCE_DIR:-$(sed -n '1s/ .*//p' "$TARGET/debian/changelog" 2>/dev/null)}"
+    fi
 
     case "$LINTIAN" in
         off | warn | error) ;;
@@ -64,10 +130,10 @@ load_config() {
     esac
 
     # Normalised to 0/1 here so the check below stays a comparison against one
-    # value. It used to be that comparison alone, which made every spelling
-    # except a literal 1 mean off: DBGSYM=on, =yes and =true each disabled the
-    # package they were written to enable, with no error and nothing in the log.
-    # Words are accepted because the neighbouring knob takes them.
+    # value. Without it every spelling but a literal 1 means off, so DBGSYM=on,
+    # =yes and =true each disable the package they were written to enable, with
+    # no error and nothing in the log. Words are accepted because the
+    # neighbouring knob takes them.
     case "$DBGSYM" in
         0 | off) DBGSYM=0 ;;
         1 | on)  DBGSYM=1 ;;
@@ -80,7 +146,7 @@ load_config() {
     # get_sources interpolates this into rm -rf, so an empty value must not
     # reach it.
     [ -n "$SOURCE_DIR" ] || {
-        echo "FATAL: no source directory could be derived from UPSTREAM=$UPSTREAM" >&2
+        echo "FATAL: no source directory could be derived from UPSTREAM=${UPSTREAM:-} or debian/changelog" >&2
         return 1
     }
 
@@ -118,7 +184,51 @@ dependencies() {
             # cargo:native/rustc:native build dependencies these packages
             # declare, silently falling back to Debian's toolchain. Installing
             # into ~/.cargo sidesteps dpkg entirely and wins on PATH.
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            #
+            # --default-toolchain none because the package names the version,
+            # not the image: upstream's rust-toolchain.toml or a
+            # RUSTUP_TOOLCHAIN in debian/rules, either of which rustup resolves
+            # and downloads on first use. Installing "stable" here as well
+            # downloads a whole second toolchain, since rustup treats the
+            # stable channel and the version it currently points at as separate
+            # installs -- measured at six components twice for one build.
+            #
+            # A Rust package that names no version fails with "no default
+            # toolchain configured" rather than silently building with whatever
+            # stable is that day, which is the failure worth having.
+            #
+            # Prefer `Build-Depends: rustup` over this whole branch. Debian
+            # ships rustup in trixie and sid, its shims are /usr/bin/rustc and
+            # /usr/bin/cargo, and it honours RUSTUP_TOOLCHAIN and
+            # rust-toolchain.toml exactly as the upstream installer does. The
+            # difference is that a declared build dependency lands in the
+            # .buildinfo's Installed-Build-Depends, where a rebuilder can
+            # resolve it from snapshot.debian.org; a toolchain curled into
+            # ~/.cargo is invisible to dpkg and appears nowhere. That is the
+            # same shape Go already has, golang-go as the bootstrap and the
+            # exact version named in the source.
+            # Fetched to a file and then run, rather than piped. A pipeline
+            # cannot be retried as one command, and in a pipe the status that
+            # reaches the shell is sh's, not curl's -- a truncated script can
+            # leave sh reporting success on a partial install.
+            _rustup_attempt() {
+                local script status
+                script="$(mktemp)"
+                if ! curl --proto '=https' --tlsv1.2 -sSf --max-time 120 \
+                    -o "$script" https://sh.rustup.rs; then
+                    rm -f "$script"
+                    return 1
+                fi
+                # No `-s --` here: those told sh to read the script from
+                # stdin, which is the pipe form. With a file, everything after
+                # it is passed to the script, so `-s` reached rustup-init and
+                # it exited with "unexpected argument '-s' found".
+                sh "$script" -y --default-toolchain none
+                status=$?
+                rm -f "$script"
+                return "$status"
+            }
+            retry "fetching the rustup installer" _rustup_attempt || return 1
             # shellcheck source=/dev/null
             . "$HOME/.cargo/env"
             ;;
@@ -137,32 +247,56 @@ dependencies() {
 }
 
 get_sources() {
-    local attempt delay
-    cd "$(mktemp -d)"
-    attempt=1
-    delay=2
 
-    while true; do
-        # A cancelled fetch leaves a partial tree behind, so a bare retry would
-        # fail on "directory exists" rather than retrying the clone. GitHub
-        # cancels HTTP/2 streams when several builds clone the same repo at
-        # once, which is exactly when this loop earns its keep.
+    # /build rather than a mktemp directory, because the path is published now:
+    # dpkg writes Build-Path into the .buildinfo, debrebuild rebuilds at exactly
+    # that path, and a random /tmp/tmp.XXXXXXXXXX tells a reader nothing while
+    # differing on every leg. /build is also the prefix dpkg accepts without
+    # --always-include-path, and what Debian's own buildds use.
+    mkdir -p /build
+    cd /build
+
+    # No upstream to clone: the packaging directory IS the source. Copied rather
+    # than built in place, so the build still happens at /build/<source> like
+    # every other package -- Build-Path keeps the same shape on every leg, and
+    # the workdir the runner mounted is left untouched.
+    #
+    # debian/ is excluded because the overlay later is its single source, and
+    # copying it here would make two. package.conf is build configuration rather
+    # than source, and no other package's source package carries one. debs/ is
+    # output from a previous local run.
+    if [ -z "${UPSTREAM:-}" ]; then
         rm -rf "$SOURCE_DIR"
+        mkdir -p "$SOURCE_DIR"
+        tar -C "$TARGET" \
+            --exclude=./debian --exclude=./debs --exclude=./package.conf \
+            -cf - . | tar -C "$SOURCE_DIR" -xf -
+        cd "$SOURCE_DIR"
+        UPSTREAM_COMMIT=""
+        UPSTREAM_EPOCH=""
+        printf 'upstream: none (native); source taken from %s\n' "$TARGET" >&2
+        return 0
+    fi
 
-        if git clone --branch "$VERSION" -- "$UPSTREAM" "$SOURCE_DIR"; then
-            break
-        fi
-
-        if [ "$attempt" -ge "$CLONE_ATTEMPTS" ]; then
-            echo "FATAL: cloning $UPSTREAM at $VERSION failed after $CLONE_ATTEMPTS attempts" >&2
-            return 1
-        fi
-
-        echo "clone attempt $attempt/$CLONE_ATTEMPTS failed; retrying in ${delay}s" >&2
-        sleep "$delay"
-        attempt=$((attempt + 1))
-        delay=$((delay * 2))
-    done
+    # A cancelled fetch leaves a partial tree behind, so a bare retry would
+    # fail on "directory exists" rather than retrying the clone. GitHub cancels
+    # HTTP/2 streams when several builds clone the same repo at once, which is
+    # exactly when this earns its keep. The clear belongs to the attempt, which
+    # is why this is a function and not the clone alone.
+    #
+    # --depth 1, because nothing here wants history. Two values are taken from
+    # the clone -- the resolved commit and its date, both of the tip -- and
+    # .git is deleted a few lines below, so a full clone pays for objects that
+    # are read once and thrown away. Measured on zig, whose upstream is the
+    # fleet's largest: 925 MB of history against 40 MB to materialise the tag,
+    # and a get_sources phase of 60-78s. It is also the one upstream not on
+    # GitHub -- Codeberg is volunteer-run, and six legs a build pass were
+    # pulling all 925 MB each.
+    _clone_attempt() {
+        rm -rf "$SOURCE_DIR"
+        git clone --depth 1 --branch "$VERSION" -- "$UPSTREAM" "$SOURCE_DIR"
+    }
+    retry "cloning $UPSTREAM at $VERSION" _clone_attempt || return 1
 
     cd "$SOURCE_DIR"
 
@@ -177,7 +311,37 @@ get_sources() {
     # has no equivalent: DEP-12 records a Repository URL with no revision, and
     # Vcs-* in debian/control describes the packaging repository, not upstream.
     UPSTREAM_COMMIT="$(git rev-parse HEAD)"
-    printf 'upstream: %s %s -> %s\n' "$UPSTREAM" "$VERSION" "$UPSTREAM_COMMIT" >&2
+
+    # And its date, which is what the orig tarball's mtimes come from. Captured
+    # here because it is the last moment .git exists.
+    #
+    # NOT SOURCE_DATE_EPOCH, which comes from OUR changelog: that restamps every
+    # file on each Debian revision of one upstream version, producing a
+    # different tarball, while the publisher stores one orig tarball per
+    # upstream version and overwrites it. Only a package's NEWEST revision then
+    # verifies, and every superseded .dsc names a checksum that exists nowhere
+    # -- measured on lychee 0.24.2, where -3 matched the published tarball and
+    # -2 did not.
+    #
+    # An orig tarball should be a function of upstream's content and nothing
+    # else. The commit date is upstream's own and does not move when we cut a
+    # new revision.
+    UPSTREAM_EPOCH="$(git log -1 --format=%ct)"
+    printf 'upstream: %s %s -> %s (committed @%s)\n' \
+        "$UPSTREAM" "$VERSION" "$UPSTREAM_COMMIT" "$UPSTREAM_EPOCH" >&2
+
+    # The commit is the only thing the build needs from git, and it is captured
+    # above. What remains is a build tree that does not match the one a rebuild
+    # gets, because a source package cannot carry .git -- and Go notices.
+    # `go build` stamps vcs.revision, vcs.time and vcs.modified into
+    # .go.buildinfo whenever a repository is present, so every Go package built
+    # here embedded metadata that nobody rebuilding from the .dsc could
+    # reproduce. Measured on croc: 160 bytes of difference, and the only
+    # difference, between our binary and debrebuild's.
+    #
+    # Deleting it rather than passing -buildvcs=false, because the flag fixes
+    # one language's symptom while the tree shape is the cause.
+    rm -rf .git
 }
 
 version_qualifier() {
@@ -245,18 +409,294 @@ apply_version_qualifier() {
     }
 }
 
+# dpkg-source clamps mtimes to SOURCE_DATE_EPOCH: anything newer is pulled down
+# to it, anything OLDER is left alone. So a debian/ carrying a stale timestamp
+# produces a different .debian.tar.xz from an otherwise identical build leg,
+# and the two legs then disagree about the checksum their own .dsc records.
+#
+# Nothing in the normal path can trigger it -- git clone and actions/checkout
+# both stamp current time, which is always newer than a changelog date. A cache
+# restore, an artifact download, or a tar -x that preserves timestamps would.
+assert_debian_mtimes() {
+    local stale
+
+    # Negated match rather than -newermt ... -prune -o -print: debian/ itself is
+    # newer than the changelog, so -prune would fire on the top directory and
+    # stop the descent before reaching a single file. The guard passed on a tree
+    # it should have rejected until a test caught it.
+    stale="$(find debian ! -newermt "@$SOURCE_DATE_EPOCH" -print)"
+
+    [ -z "$stale" ] || {
+        echo "FATAL: these files under debian/ predate the changelog entry" >&2
+        echo "       (@$SOURCE_DATE_EPOCH). dpkg-source would preserve their" >&2
+        echo "       timestamps and this leg's source package would not match" >&2
+        echo "       the others'." >&2
+        printf '%s\n' "$stale" | sed 's/^/  /' >&2
+        return 1
+    }
+}
+
+# A 3.0 (quilt) package needs its upstream tarball to already exist -- dpkg-source
+# will not invent one, and what we have is a git checkout. Every field that
+# varies between machines is pinned: --sort=name fixes entry order, --mtime the
+# timestamps, --owner/--group/--numeric-owner the ownership.
+#
+# This is deliberately stronger than dpkg-source's clamp, which only lowers
+# mtimes that are too new. Setting them unconditionally means even a tree with
+# stale timestamps yields the same bytes.
+#
+# The tarball is shared by all three suites -- the qualifier lands on the Debian
+# revision, so 11.3.6-1 and 11.3.6-1~haus13+1 have the same upstream version --
+# so it must not vary by builder image either. Verified byte-identical across
+# amd64 and arm64, 2 to 32 cores, different build paths, two independent clones,
+# and all three images (whose gzip versions differ).
+make_orig_tarball() {
+    local format source upstream tarball
+
+    format="$(cat debian/source/format 2>/dev/null || true)"
+    case "$format" in
+        *native*)
+            # No upstream tarball exists for a native package by definition.
+            return 0
+            ;;
+    esac
+
+    source="$(dpkg-parsechangelog -l debian/changelog -S Source)"
+    upstream="$(dpkg-parsechangelog -l debian/changelog -S Version)"
+    # Everything before the last hyphen, which is how dpkg splits it too.
+    upstream="${upstream%-*}"
+    tarball="../${source}_${upstream}.orig.tar.gz"
+
+    # gzip stores an mtime for the file it compresses, but reads a pipe here and
+    # so records none. That is what keeps -z deterministic; do not replace this
+    # with a two-step tar-then-gzip on a real file.
+    #
+    # The mtime is upstream's commit date, NOT SOURCE_DATE_EPOCH: the latter
+    # comes from our changelog and so changes with every Debian revision, which
+    # made one upstream version produce several different orig tarballs. See
+    # the capture site in get_sources. The fallback keeps a native or
+    # commit-less build working, where there is no revision churn to cause the
+    # problem in the first place.
+    tar --sort=name --mtime="@${UPSTREAM_EPOCH:-$SOURCE_DATE_EPOCH}" \
+        --owner=0 --group=0 --numeric-owner \
+        --exclude=./debian --exclude=./.git \
+        -czf "$tarball" .
+
+    # And put the working tree on the same clock as the tarball just written.
+    #
+    # dpkg-deb clamps mtimes NEWER than SOURCE_DATE_EPOCH and leaves older ones
+    # alone, so provenance decides the packaged timestamps: here the tree comes
+    # from a git clone and every file is newer than the epoch, so it is clamped
+    # down to it, while a rebuilder unpacks the tarball above, whose stamps are
+    # older and therefore survive. The two disagree and the .deb differs.
+    #
+    # debian/ is excluded deliberately. Those files already agree -- dpkg-source
+    # stamps them into the .debian.tar and both paths land on the epoch -- so
+    # moving them here would create a divergence rather than close one.
+    find . -path ./debian -prune -o -exec touch -h -d "@${UPSTREAM_EPOCH:-$SOURCE_DATE_EPOCH}" {} +
+
+    printf 'orig tarball: %s\n' "$(basename "$tarball")" >&2
+}
+
+# The compiler that ran, which is not always the one that was installed: rustup
+# installs current stable and then honours a rust-toolchain.toml, and Go's
+# GOTOOLCHAIN follows go.mod. Both resolve against the working directory, so
+# this must be called from inside the source tree -- reading them from $HOME
+# reports the bootstrap and pins the wrong version.
+resolved_toolchains() {
+    local pin version
+
+    if command -v rustc >/dev/null 2>&1; then
+        # Where upstream ships no rust-toolchain.toml the version is pinned in
+        # debian/rules, and `export` there reaches make's recipes rather than
+        # this shell. With no default toolchain installed the rustup shim has
+        # nothing to resolve from here, so it must be asked for. Asked of make
+        # rather than read out of the file, because make is what evaluates it;
+        # an explicit target from --eval beats the catch-all pattern rule these
+        # files all have, so nothing is built.
+        # $(RUSTUP_TOOLCHAIN) is make's expansion, not the shell's, so the
+        # single quotes are the point.
+        # shellcheck disable=SC2016
+        pin="$(make -f debian/rules \
+            --eval='__pkghaus_toolchain: ; @printf %s "$(RUSTUP_TOOLCHAIN)"' \
+            __pkghaus_toolchain 2>/dev/null || true)"
+
+        if [ -n "$pin" ]; then
+            version="$(RUSTUP_TOOLCHAIN="$pin" rustc --version 2>/dev/null || true)"
+        else
+            version="$(rustc --version 2>/dev/null || true)"
+        fi
+
+        # Nothing rather than "unknown": the line is a claim about what built
+        # the package, and a placeholder is a worse answer than its absence.
+        [ -z "$version" ] || printf 'Rustc: %s\n' "$version"
+    fi
+
+    if command -v go >/dev/null 2>&1; then
+        version="$(go version 2>/dev/null || true)"
+        [ -z "$version" ] || printf 'Go: %s\n' "$version"
+    fi
+}
+
+# Sets SIGN_KEY_FPR (and SIGN_GNUPGHOME) when a source-signing key is supplied,
+# so dpkg-buildpackage signs the .dsc it produces. With no key the build stays
+# unsigned and nothing here runs.
+#
+# Two things decide the shape of this.
+#
+# The keyring is created OUTSIDE the package directory. A native package's
+# source tarball is that directory, so a keyring inside it would be shipped in
+# the published .dsc with the private half in it.
+#
+# The clock is pinned, because an OpenPGP signature carries its creation time
+# and six legs build the same source package. Left to the wall clock each leg
+# signs a different .dsc; the artifact merge keeps one, and the five .buildinfo
+# records naming the others describe a file nobody can fetch. Ed25519 is
+# deterministic, so with the time fixed the six agree byte for byte.
+# Thin wrapper so tracing is restored on EVERY exit path, including the two
+# fatal ones. This file runs under `set -x`, which expands and prints its
+# arguments: without the suppression below the armored private key lands in the
+# build log in full, twice, once for the emptiness test and once for the import.
+# GitHub masks registered secrets, but a private key must not rest on that, and
+# a local `docker run` has no masking at all.
+prepare_source_signing() {
+    local had_x rc
+    case "$-" in *x*) had_x=1 ;; *) had_x=0 ;; esac
+    set +x
+    _prepare_source_signing
+    rc=$?
+    if [ "$had_x" = 1 ]; then set -x; fi
+    return "$rc"
+}
+
+_prepare_source_signing() {
+    local colons fpr created sign_epoch
+
+    [ -n "${SOURCE_SIGNING_KEY:-}" ] || return 0
+
+    SIGN_GNUPGHOME="$(mktemp -d)"
+    chmod 0700 "$SIGN_GNUPGHOME"
+
+    if ! printf '%s' "$SOURCE_SIGNING_KEY" \
+        | GNUPGHOME="$SIGN_GNUPGHOME" gpg --batch --quiet --import 2>/dev/null; then
+        echo "FATAL: SOURCE_SIGNING_KEY is set but gpg could not import it." >&2
+        return 1
+    fi
+
+    # The signing SUBKEY, never the primary: the CI export carries the primary
+    # only as a stub, and the whole point of the separate subkey is that this
+    # key cannot sign a Release. Field 12 is the capability list and field 6 the
+    # creation time; the fingerprint is on the fpr: line that follows.
+    colons="$(GNUPGHOME="$SIGN_GNUPGHOME" gpg --batch --with-colons \
+        --list-secret-keys 2>/dev/null)"
+    read -r fpr created <<EOF
+$(printf '%s\n' "$colons" | awk -F: '
+    /^ssb:/ { caps = $12; ts = $6; next }
+    /^fpr:/ && caps != "" { if (caps ~ /s/) { print $10, ts; exit } caps = "" }')
+EOF
+
+    # Fatal rather than a quiet fall back to unsigned. A secret that has expired
+    # or lost its subkey would otherwise publish unsigned source packages for as
+    # long as nobody thought to look at one.
+    if [ -z "$fpr" ]; then
+        echo "FATAL: SOURCE_SIGNING_KEY carries no signing subkey." >&2
+        printf '%s\n' "$colons" >&2
+        return 1
+    fi
+
+    # gpg refuses to sign with a key the clock says does not exist yet:
+    # "clear-sign failed: Time conflict", and dpkg-buildpackage then fails the
+    # build. SOURCE_DATE_EPOCH is the changelog date, and the archive rebuilds a
+    # tag whenever it first needs it, sometimes weeks after the tag was cut, so
+    # a changelog older than the subkey is the ordinary case rather than an
+    # exotic one. Clamping keeps every leg on the same value either way.
+    sign_epoch="$SOURCE_DATE_EPOCH"
+    # An if, not `[ ... ] && x=y`: load_config documents why 540 lines up. The
+    # && form evaluates to false when the test fails, so it would become this
+    # function's exit status the moment it was the last statement.
+    if [ "$created" -gt "$sign_epoch" ]; then
+        sign_epoch="$created"
+    fi
+
+    # The CI export is passphrase-less, so batch and no-tty are enough; a
+    # protected key fails here with "No secret key" rather than hanging on a
+    # pinentry that does not exist. digest-algo is pinned so the signature does
+    # not move with a gpg default.
+    cat > "$SIGN_GNUPGHOME/gpg.conf" <<EOF
+faked-system-time ${sign_epoch}!
+batch
+no-tty
+digest-algo SHA256
+EOF
+
+    SIGN_KEY_FPR="$fpr"
+    export GNUPGHOME="$SIGN_GNUPGHOME"
+
+    # Dropped once it is in the keyring, so it is not in the environment every
+    # upstream build script inherits, nor in anything that dumps `env`. This
+    # narrows the copies; it does not make the key unreadable, because the
+    # keyring GNUPGHOME points at is still there and has to be. A key handed to
+    # a build leg is readable by that build, which is the whole reason this is a
+    # different subkey from the one that signs Release files.
+    unset SOURCE_SIGNING_KEY
+
+    echo "signing the source package with $fpr (clock pinned to $sign_epoch)"
+}
+
 build() {
     # Some upstreams ship a debian/ of their own. Without this, cp would nest
     # ours inside theirs as debian/debian and the build would use theirs.
     rm -rf debian
     cp -a "$TARGET/debian" .
 
+    # The upstream revision, written where the source package can carry it.
+    #
+    # The clone's .git is removed before the build, because a source package
+    # cannot contain one and anything that reads it would make our build differ
+    # from a rebuild of our own .dsc. That is correct and it is what makes Go
+    # binaries reproducible -- but three packages were reading it for their
+    # version string and quietly lost it: berry's configure fell back to a stale
+    # hardcoded 0.1.7, vergen emitted its placeholder into viddy, and vegeta's
+    # own rules ran `git rev-parse HEAD` against a tree with no .git.
+    #
+    # An environment variable cannot fix that: dpkg records only
+    # DEB_BUILD_OPTIONS and SOURCE_DATE_EPOCH in the .buildinfo's Environment,
+    # so a rebuilder would not replay it and the rebuild would differ. Inside
+    # debian/ it travels in the .dsc, which is the same move that pins the Rust
+    # toolchain. It also answers a question `apt-get source` could not: which
+    # upstream commit this source was taken from.
+    #
+    # Before assert_debian_mtimes, so a file written now is newer than
+    # SOURCE_DATE_EPOCH rather than tripping the guard.
+    if [ -n "${UPSTREAM_COMMIT:-}" ]; then
+        printf '%s\n' "$UPSTREAM_COMMIT" > debian/upstream-commit
+    fi
+
     # Reads Build-Depends straight from the debian/ just copied in. Preferred
     # over devscripts' mk-build-deps because it needs no extra packages in the
     # image and no `yes |` pipe, while producing an identical package.
     apply_version_qualifier
 
+    # After the qualifier, so the timestamp is the one dpkg-source will use.
+    SOURCE_DATE_EPOCH="$(dpkg-parsechangelog -l debian/changelog -S Timestamp)"
+    export SOURCE_DATE_EPOCH
+
+    assert_debian_mtimes
+    make_orig_tarball
+
     apt-get build-dep -y ./
+
+    # TOOLCHAIN=rust curls a toolchain into ~/.cargo, which wins on PATH over
+    # the shims a declared `Build-Depends: rustup` installs. Both at once means
+    # the build uses the invisible one while the .buildinfo names the other --
+    # the exact misrecording declaring rustup is meant to end.
+    if [ "$TOOLCHAIN" = rust ] && dpkg -S /usr/bin/rustc >/dev/null 2>&1; then
+        echo "FATAL: this package declares a Rust toolchain as a build dependency" >&2
+        echo "       and also sets TOOLCHAIN=rust. Drop TOOLCHAIN=rust: the" >&2
+        echo "       declared one is recorded in the .buildinfo, the curled one" >&2
+        echo "       is not, and the curled one is what would build." >&2
+        return 1
+    fi
 
     # The standard entry point rather than calling debian/rules directly: it
     # runs dpkg-source --before-build, then the clean, build and binary targets
@@ -266,7 +706,33 @@ build() {
     # The failure is caught to add the hint: when a package has not been built
     # for this architecture before, dpkg-buildpackage reports it as a
     # dpkg-genbuildinfo subprocess failure, which says nothing about why.
-    if ! dpkg-buildpackage --build=binary --no-sign; then
+    # --build=full rather than binary: it additionally produces the .dsc and the
+    # two source tarballs, which is what lets debrebuild verify these packages.
+    # Given a .buildinfo alone it resolves the whole environment from
+    # snapshot.debian.org and then stops, because the source package was never
+    # in Debian and debsnap cannot find it. A .dsc sitting beside the record is
+    # the entire fix -- debrebuild prefers a local one and never calls debsnap.
+    #
+    # --always-include-path because dpkg writes Build-Path only when the build
+    # directory starts with /build/, and debrebuild's mmdebstrap builder calls
+    # dirname() on that field unconditionally: without it the rebuild dies with
+    # "fileparse(): need a valid pathname". --no-respect-build-path does not
+    # help, it sets the same variable to undef.
+    #
+    # Signing is dpkg's own stage rather than a gpg call afterwards, and that is
+    # load-bearing: the .buildinfo records a sha256 OF THE .dsc, and dpkg
+    # recomputes it after signing. Signing the .dsc once the record existed
+    # would leave every published record naming a file that no longer matches.
+    prepare_source_signing || return 1
+    local -a sign_args
+    if [ -n "${SIGN_KEY_FPR:-}" ]; then
+        sign_args=(--sign-key="$SIGN_KEY_FPR")
+    else
+        sign_args=(--no-sign)
+    fi
+
+    if ! dpkg-buildpackage --build=full "${sign_args[@]}" \
+        --buildinfo-option=--always-include-path; then
         echo "FATAL: dpkg-buildpackage failed." >&2
         echo "  Does Architecture in debian/control permit $(dpkg --print-architecture)?" >&2
         return 1
@@ -292,7 +758,13 @@ collect() {
     # Canonical Debian names, unaltered: the suite-qualified version already
     # makes them unique across suites, so there is nothing left to disambiguate.
     # .changes is not collected -- the archive ingests .deb files directly.
-    for artefact in ../*.deb ../*.buildinfo; do
+    # The source package travels with the binaries: debrebuild looks for the
+    # .dsc in the same directory as the .buildinfo, so publishing them together
+    # is what makes a record actionable rather than merely readable.
+    # *.tar.* rather than the two quilt names: a native package's source is a
+    # single <source>_<version>.tar.xz, and collecting the .dsc without it would
+    # publish a source package that cannot be unpacked.
+    for artefact in ../*.deb ../*.buildinfo ../*.dsc ../*.tar.*; do
         name="$(basename "$artefact")"
 
         install -o "$uid" -g "$gid" -m 0644 "$artefact" "$dest/$name"
@@ -304,10 +776,26 @@ collect() {
             # records the environment a package was built in; this records the
             # source it was built from, which nothing in the .deb, the
             # .buildinfo or debian/control carries.
+            #
+            # The toolchain lines are provenance, not mechanism: debrebuild
+            # reads only the .buildinfo and will never see this file. What makes
+            # a compiler reproducible is pinning it in the source -- go.mod for
+            # Go, rust-toolchain.toml or RUSTUP_TOOLCHAIN for Rust -- so that it
+            # travels inside the .dsc.
             *.buildinfo)
-                printf 'Repository: %s\nRef: %s\nCommit: %s\n' \
-                    "$UPSTREAM" "$VERSION" "$UPSTREAM_COMMIT" \
-                    > "$dest/${name%.buildinfo}.source"
+                {
+                    # A native package has no upstream to name, and saying so
+                    # with empty fields would read as a failed lookup. The
+                    # source package IS the source: the .dsc and the tarball
+                    # beside this file are the whole answer.
+                    if [ -n "${UPSTREAM:-}" ]; then
+                        printf 'Repository: %s\nRef: %s\nCommit: %s\n' \
+                            "$UPSTREAM" "$VERSION" "$UPSTREAM_COMMIT"
+                    else
+                        printf 'Repository: none (native package; the source package is the source)\n'
+                    fi
+                    resolved_toolchains
+                } > "$dest/${name%.buildinfo}.source"
                 chown "$uid:$gid" "$dest/${name%.buildinfo}.source"
                 chmod 0644 "$dest/${name%.buildinfo}.source"
                 ;;
@@ -346,13 +834,34 @@ check() {
     esac
 }
 
+# 88% of this pipeline's runner time is inside this script. One number per leg
+# -- 170 seconds for croc, 600 for zola -- cannot tell an image pull from a
+# dependency install from a compile, which makes every optimisation guesswork.
+#
+# Each phase is still called directly by main below, rather than through a
+# wrapper taking the function name. A wrapper reads better and cost a green
+# lint: passing these as arguments makes shellcheck lose track of who invokes
+# what, and it starts reporting the retry helpers' callbacks as dead code
+# (SC2329). Timing is not worth disabling a check that finds real dead code.
+PHASE_TOTAL=0
+phase_done() { # name start-epoch
+    local elapsed
+    elapsed=$(( $(date +%s) - $2 ))
+    PHASE_TOTAL=$(( PHASE_TOTAL + elapsed ))
+    # Printed as each phase finishes rather than as one summary at the end, so
+    # a run that dies in build still reports what the phases before it cost.
+    echo "==> phase $1: ${elapsed}s (cumulative ${PHASE_TOTAL}s)"
+}
+
 main() {
-    load_config
-    dependencies
-    get_sources
-    build
-    collect
-    check
+    local t
+    t="$(date +%s)"; load_config;  phase_done load_config  "$t"
+    t="$(date +%s)"; dependencies; phase_done dependencies "$t"
+    t="$(date +%s)"; get_sources;  phase_done get_sources  "$t"
+    t="$(date +%s)"; build;        phase_done build        "$t"
+    t="$(date +%s)"; collect;      phase_done collect      "$t"
+    t="$(date +%s)"; check;        phase_done check        "$t"
+    echo "==> build complete in ${PHASE_TOTAL}s"
 }
 
 main
