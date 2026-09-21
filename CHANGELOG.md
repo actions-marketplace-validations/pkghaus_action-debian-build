@@ -8,6 +8,14 @@ Consumers pin the floating major (`@v1`), which always points at the newest
 `package.conf` keys, artifact names — is a breaking change and gets a new
 major. Exact tags never move.
 
+## [Unreleased]
+
+### Fixed
+
+- Every apt call in the DEP-8 step, and the keyring fetch in the extra-debs
+  container, retry. `Acquire::Retries` defaults to 0, so one refused fetch
+  failed the build.
+
 ## [1.11.0] - 2026-09-16
 
 ### Changed
