@@ -1,0 +1,13 @@
+# This test exists to make CI execute the action's DEP-8 STEP, not to test the
+# fixture. Without a debian/tests/control the step reaches "no
+# debian/tests/control, nothing to run" and exits 0, which reads exactly like
+# coverage while the runner's apt, the generated testbed image, autopkgtest
+# and its --setup-commands all go unexercised. A change to those four stages
+# shipped on 2026-09-21 with nothing but hand-running behind it.
+#
+# allow-stderr matches the fleet (37 of its 42 tests). No needs-root and no
+# isolation-container: the binary is world-executable and needs neither, and
+# an ungranted restriction is a SKIP, which this action counts as a failure.
+Tests: runs
+Depends: deb-build-fixture
+Restrictions: allow-stderr

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Assert the installed binary runs and says what it should. Deliberately
+# trivial: the subject under test is the action's DEP-8 machinery, not this
+# program. Anything slower would tax every CI run for no extra signal.
+set -eu
+
+out="$(deb-build-fixture)"
+[ "$out" = "action-debian-build fixture" ] || {
+    printf 'FAIL: got [%s]\n' "$out" >&2
+    exit 1
+}
+echo "PASS: the installed binary ran"
