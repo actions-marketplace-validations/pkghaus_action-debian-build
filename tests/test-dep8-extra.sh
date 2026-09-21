@@ -108,4 +108,81 @@ for good in 'DEP8_EXTRA_DEBS=i3lock-color' 'DEP8_EXTRA_DEBS=libfoo1 bar-baz+x.y'
     fi
 done
 
-summary 12
+# --- the container's network stages retry ------------------------------------
+# Every fetch in that container was unretried: two apt-gets against
+# deb.debian.org, a curl for the keyring, then an update and a download
+# against apt.pkg.haus. apt's own Acquire::Retries default is 0, so one
+# refused fetch failed a release leg. Asserted against the shipped step text
+# rather than by running it, because running it reaches the live archive --
+# the same reason run_step stops at the docker stub.
+# Scoped to the extra-debs container, not the whole step: the step's other
+# apt calls run on the runner and in the testbed image and carry the budget
+# as an -o flag instead, so a whole-step search would conflate the two and
+# the ordering check below would compare against the wrong apt-get.
+body="$(sed -n '/docker run --rm --volume/,/^    "$/p' "$step")"
+[ -n "$body" ] || { echo "FATAL: could not isolate the extra-debs container" >&2; exit 1; }
+
+if printf '%s' "$body" | grep -q 'Acquire::Retries'; then
+    report pass "the container sets an apt retry budget"
+else
+    report fail "the container sets an apt retry budget" "no Acquire::Retries in the step"
+fi
+
+# Ordering is the whole point: written after the first apt-get, it would cover
+# the archive fetches and leave the deb.debian.org ones bare -- a half-fix that
+# a presence check alone would call green.
+retries_at="$(printf '%s\n' "$body" | grep -n 'Acquire::Retries' | head -1 | cut -d: -f1)"
+apt_at="$(printf '%s\n' "$body" | grep -n 'apt-get update' | head -1 | cut -d: -f1)"
+if [ -n "$retries_at" ] && [ -n "$apt_at" ] && [ "$retries_at" -lt "$apt_at" ]; then
+    report pass "  and sets it before the first apt-get"
+else
+    report fail "  and sets it before the first apt-get" \
+        "Acquire::Retries at line ${retries_at:-none}, first apt-get at ${apt_at:-none}"
+fi
+
+keyring_curl="$(printf '%s\n' "$body" | grep 'curl ' | grep -v '^[[:space:]]*#' || true)"
+case "$keyring_curl" in
+    *--retry\ [1-9]*) report pass "the keyring fetch is retried" ;;
+    *) report fail "the keyring fetch is retried" "curl line was [$keyring_curl]" ;;
+esac
+
+# --retry-all-errors would retry a 404 too, so a moved keyring would hang for
+# the whole budget instead of saying so at once.
+case "$keyring_curl" in
+    *--retry-all-errors*) report fail "the keyring fetch does not retry every error" \
+                                     "--retry-all-errors would also retry a 404" ;;
+    *) report pass "the keyring fetch does not retry every error" ;;
+esac
+
+# The other three apt stages in this step are on the runner, in the generated
+# testbed Dockerfile and in autopkgtest's setup-commands. They cannot share
+# the container's conf file, so they carry the budget inline. Counted rather
+# than merely present: dropping one is the regression this catches.
+whole="$(cat "$step")"
+# OCCURRENCES, not lines. The generated testbed Dockerfile puts two apt-get
+# calls on one echoed line, so a line count reads 4 whether that line carries
+# one budget or two -- un-retrying half of it would pass unnoticed.
+inline="$(printf '%s\n' "$whole" | grep -o 'apt-get -o Acquire::Retries=5' | wc -l | tr -d ' ')"
+if [ "$inline" -eq 5 ]; then
+    report pass "the step's other apt calls carry an inline retry budget (5)"
+else
+    report fail "the step's other apt calls carry an inline retry budget (5)" \
+        "counted $inline"
+fi
+
+# No apt-get anywhere in the step may be left bare. Comment lines and the
+# apt-get inside the container (covered by its conf) are excluded.
+bare="$(printf '%s\n' "$whole" \
+    | sed -n '/docker run --rm --volume/,/^    "$/!p' \
+    | grep 'apt-get' | grep -v '^[[:space:]]*#' \
+    | grep -vc 'Acquire::Retries' || true)"
+if [ "$bare" -eq 0 ]; then
+    report pass "no apt call outside the container is left unretried"
+else
+    report fail "no apt call outside the container is left unretried" \
+        "$bare bare call(s): $(printf '%s\n' "$whole" \
+            | sed -n '/docker run --rm --volume/,/^    "$/!p' \
+            | grep 'apt-get' | grep -v '^[[:space:]]*#' | grep -v 'Acquire::Retries' | head -2)"
+fi
+
+summary 18
