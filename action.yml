@@ -136,8 +136,15 @@ runs:
         # but only Recommends it, so --no-install-recommends drops it. Runner
         # images happen to carry it, which would hide the omission until one
         # stopped.
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends autopkgtest iproute2
+        #
+        # -o Acquire::Retries: apt's default is 0, so one refused fetch fails
+        # the leg. Every apt call in this step carries it -- here, in the
+        # testbed image below, in autopkgtest's setup-commands, and in the
+        # extra-debs container, which uses a conf file because four calls run
+        # there. Same budget as verify/Dockerfile in the archive repos.
+        sudo apt-get -o Acquire::Retries=5 update
+        sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+            autopkgtest iproute2
 
         # This runs on the runner rather than inside the builder image, and it
         # has to. autopkgtest grants the isolation-container capability only
@@ -178,7 +185,7 @@ runs:
         testbed="$(mktemp -d)"
         {
             echo "FROM debian:${SUITE}"
-            echo "RUN apt-get update && apt-get install -y --no-install-recommends sysvinit-core && rm -rf /var/lib/apt/lists/*"
+            echo "RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends sysvinit-core && rm -rf /var/lib/apt/lists/*"
         } > "${testbed}/Dockerfile"
         docker build -q -t "dep8-testbed:${SUITE}" "${testbed}"
 
@@ -198,9 +205,26 @@ runs:
         if [ -n "${extra_debs}" ]; then
             extra_dir="$(mktemp -d)"
             docker run --rm --volume "${extra_dir}:/out" "debian:${SUITE}" sh -ec "
+                # apt's own default is 0 retries, so a single refused fetch
+                # fails the whole leg. Written before the first apt-get so it
+                # covers all four network stages in this container: the two
+                # against deb.debian.org below, and the update and download
+                # against apt.pkg.haus at the end. Same file name and budget
+                # as verify/Dockerfile in the archive repos, which added it
+                # for the same reason.
+                printf 'Acquire::Retries \"5\";\n' \
+                    > /etc/apt/apt.conf.d/80-pkghaus-retries
                 apt-get update -qq
                 apt-get install -y -qq --no-install-recommends ca-certificates curl >/dev/null
-                curl -fsSL -o /usr/share/keyrings/pkghaus-archive-keyring.gpg \
+                # --retry for the same reason as the apt conf above: one
+                # transient edge failure should not fail a release leg. Sized
+                # to match that budget rather than to a measured outage --
+                # unlike the aptly download in the archive repo, this host is
+                # ours and has no recorded multi-minute window. No
+                # --retry-all-errors: a 404 here means the keyring moved, and
+                # that should answer at once rather than after the budget.
+                curl -fsSL --retry 5 --retry-max-time 120 \
+                    -o /usr/share/keyrings/pkghaus-archive-keyring.gpg \
                     https://apt.pkg.haus/pkghaus-archive-keyring.gpg
                 echo 'deb [signed-by=/usr/share/keyrings/pkghaus-archive-keyring.gpg] https://apt.pkg.haus ${SUITE} main' \
                     > /etc/apt/sources.list.d/pkghaus.list
@@ -244,7 +268,7 @@ runs:
         dep8_run() {
             autopkgtest \
                 --summary-file "${summary}" \
-                --setup-commands 'apt-get update -qq' \
+                --setup-commands 'apt-get -o Acquire::Retries=5 update -qq' \
                 "${dep8_debs[@]}" . \
                 -- docker --init "dep8-testbed:${SUITE}"
         }
